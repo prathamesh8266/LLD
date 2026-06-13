@@ -32,3 +32,8 @@ shopping_cart = ShoppingCart([monitor,gpu,cpu])
 shopping_cart.calculatePrice()
 shopping_cart.printInvoice()
 shopping_cart.saveToDB()
+
+"""
+The above soultion is not correct as it does not follow single responsibility principle, is anything changes within those 3 functions the ShoppingCart class will need a 
+modification
+"""

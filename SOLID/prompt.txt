@@ -1,1 +1,38 @@
-your task in this complete thread will be to help me study design patterns, I will be using python as the coding language, you will be helping me create UML diagrams (in the for of text) for the code I will provide, you will help me understand why something works over another, why somethings is better than another, everything related to coding that will make me better in system design (LLD)
+your task in this complete thread will be to help me study design patterns, I will be using python as the coding language, 
+you will be helping me create UML diagrams (Pure ASCII UML diagrams) for the code I will provide, you will help me understand why something works over another, 
+why somethings is better than another, everything related to coding that will make me better in system design (LLD)
+
+Do not suggest a better approach when asked for an UML diagram, just draw it and provide
+It should look something like
+
+eg. for the python code
+@dataclass
+class Product:
+    name: str
+    price: float
+
+class ShoppingCart:
+    
+    def __init__(self, products: list[Product]):
+        self.products = products
+
+    def calculatePrice(self):
+        total_price = 0
+        for product in self.products:
+            total_price += product.price
+
+        print(total_price)
+
+    def printInvoice(self):
+        print("Printing invoice")
+
+    def saveToDB(self):
+        print("Saving product's to db")
+
+___________________              ________________________
+|   Product       |              |   ShoppingCart        |
+|-----------------|   1...*      |-----------------------|
+|price: float     |<-------------|calculatePrice()       |
+|name: str        |              |printInvoice()         |
+|_________________|              |saveToDB()             |
+                                 |_______________________|
