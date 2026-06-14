@@ -5,7 +5,7 @@ eg. To integrate a new feature you should not modify the methods/ add the method
 
 """
 Problem in previous SRP flow, what is we want to store the products to files as well as other databases,
-adding saveTOMong(), saveToFile() inside cartDBStorage would be wrong as it will break open close principle
+adding saveTOMongo(), saveToFile() inside cartDBStorage would be wrong as it will break open close principle
 
 we can solve this issue using abstraction, injheritance and polimorfism
 ___________________                _______________________________
@@ -71,9 +71,9 @@ class cartInvoicePrinter(Printer):
     def print(self):
         print("Shopping cart invoice")
         for product in self.shoppingCart.products:
-            print(f'name: {product.name} - ${product.price}')
+            print(f'name: {product.name} - Rs.{product.price}')
 
-        print(f"Total: ${self.shoppingCart.calculateTotalPrice()}")
+        print(f"Total: Rs.{self.shoppingCart.calculateTotalPrice()}")
 
 class cartDBStorage(Storage):
 
@@ -90,9 +90,8 @@ cpu = Product("cpu",75000)
 
 shopping_cart = ShoppingCart([monitor,gpu,cpu])
 
-print_invoice = cartInvoicePrinter(shopping_cart)
+print_invoice: Printer = cartInvoicePrinter(shopping_cart)
 print_invoice.print()
 
-
-store_to_db = cartDBStorage(shopping_cart)
+store_to_db: Storage = cartDBStorage(shopping_cart)
 store_to_db.store()

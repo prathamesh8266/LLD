@@ -1,0 +1,424 @@
+//@version=6
+// ============================================================================
+//  S/D + TREND + CONFLUENCE  —  v3  (specialised for NAS100 & US30)
+// ----------------------------------------------------------------------------
+//  Built for US index intraday only. Auto-detects NAS100 / US30, ignores other
+//  symbols (no trades + warning). Per-instrument presets + NY-session filter.
+//
+//  OVER-FITTING WARNING: the preset values are tuned starting points for these
+//  two indices, not optimal truth. Backtest + validate out-of-sample on your
+//  own data. Not financial advice.
+//
+//  To reproduce the previous (v2.1) behaviour exactly on these symbols:
+//  set "Use per-instrument presets" = off AND "Trade only during session" = off.
+//
+//  DIAGNOSTIC: if the top-right info table shows, the script compiled.
+// ============================================================================
+
+strategy("S/D Confluence v3 (NAS100/US30)",
+     shorttitle              = "SD v3 IDX",
+     overlay                 = true,
+     pyramiding              = 0,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.02,
+     calc_on_every_tick      = false,
+     process_orders_on_close = true,
+     max_boxes_count         = 500,
+     max_labels_count        = 500)
+
+// ============================================================================
+//  INPUTS
+// ============================================================================
+gI = "0) Instrument & session"
+profileMode = input.string("Auto", "Instrument profile", options=["Auto","NAS100","US30"], group=gI)
+restrictSym = input.bool(true,  "Trade only NAS100 & US30", group=gI)
+usePresets  = input.bool(true,  "Use per-instrument presets (override inputs below)", group=gI,
+     tooltip="On = tuned starting values per index. Off = use the manual inputs below. Always re-optimise on your own data.")
+useSession  = input.bool(true,  "Trade only during session", group=gI)
+sessionTime = input.session("0930-1600", "Session (US cash hours)", group=gI)
+sessionTz   = input.string("America/New_York", "Session timezone", group=gI)
+
+gT = "1) Trend filter"
+emaFastLen  = input.int(50,  "Fast EMA", minval=1, group=gT)
+emaSlowLen  = input.int(200, "Slow EMA", minval=1, group=gT)
+usePriceLoc = input.bool(true, "Require price on trend side of Fast EMA", group=gT)
+useHtf      = input.bool(true, "Use higher-timeframe trend in score", group=gT)
+htfTf       = input.timeframe("240", "Higher timeframe", group=gT)
+useAdx      = input.bool(false, "Require trend strength (ADX)", group=gT)
+adxLen      = input.int(14, "ADX length", group=gT)
+adxMin      = input.float(20, "Min ADX to trade", step=1, group=gT)
+
+gZ = "2) Supply / Demand zones"
+pivotLen    = input.int(8, "Pivot lookback (left = right)", minval=2, group=gZ)
+zoneStyle   = input.string("Wick", "Zone thickness", options=["Wick","Body","Full candle"], group=gZ)
+minZoneATR  = input.float(0.25, "Min zone thickness (ATR mult)", minval=0.0, step=0.05, group=gZ)
+maxZoneATR  = input.float(4.0,  "Max zone thickness (ATR mult)", minval=0.5, step=0.1, group=gZ)
+maxZones    = input.int(8, "Max active zones per side", minval=1, maxval=20, group=gZ)
+tapBars     = input.int(2, "Tap window (bars to tag the zone)", minval=1, group=gZ)
+freshOnly   = input.bool(false, "Only signal on untested (fresh) zones", group=gZ)
+
+gQ = "3) Zone QUALITY gates"
+useImpulse  = input.bool(true,  "Require impulsive departure from zone", group=gQ)
+impulseATR  = input.float(1.0,  "Min departure (ATR mult)  [manual]", minval=0.1, step=0.1, group=gQ)
+useZoneVol  = input.bool(false, "Require volume on the departure  [manual]", group=gQ)
+departVolMult = input.float(1.2, "Departure volume multiple  [manual]", minval=1.0, step=0.1, group=gQ)
+
+gC = "4) Confirmation (entry trigger)"
+useEngulf   = input.bool(true,  "Require engulfing candle", group=gC)
+useVol      = input.bool(false, "Require volume spike at entry", group=gC)
+volLen      = input.int(20, "Volume average length", minval=1, group=gC)
+volMult     = input.float(1.5, "Entry volume spike multiple", minval=1.0, step=0.1, group=gC)
+engulfBodyR = input.float(1.0, "Min engulfing body vs prev body", minval=0.1, step=0.1, group=gC)
+
+gX = "5) Confluence parameters"
+rsiLen      = input.int(14, "RSI length", group=gX)
+rsiBull     = input.int(50, "LONG needs RSI >=", group=gX)
+rsiBear     = input.int(50, "SHORT needs RSI <=", group=gX)
+
+gP = "6) Probability / trade rules"
+onlyWithTrend = input.bool(true, "Only TRADE trend-aligned setups", group=gP)
+minScore      = input.int(3, "Minimum confluence score (0-6)  [manual]", minval=0, maxval=6, group=gP)
+
+gR = "7) Risk / exits"
+riskPerc    = input.float(1.0, "Risk per trade (% of equity)", minval=0.0, step=0.1, group=gR)
+atrLen      = input.int(14, "ATR length", group=gR)
+slBufATR    = input.float(0.5, "Stop buffer beyond zone (ATR mult)  [manual]", minval=0.0, step=0.1, group=gR)
+rr          = input.float(2.0, "Final reward : risk  [manual]", minval=0.1, step=0.1, group=gR)
+useScaleOut = input.bool(true, "Partial take-profit + breakeven", group=gR)
+tp1R        = input.float(1.0, "TP1 at R multiple", minval=0.1, step=0.1, group=gR)
+tp1Pct      = input.int(50, "TP1 close %", minval=1, maxval=100, group=gR)
+useTimeGuard= input.bool(true, "Restrict trading to 15m - 4h chart", group=gR)
+
+gV = "8) Display"
+showTable   = input.bool(true, "Show info table", group=gV)
+showZones   = input.bool(true, "Draw zones", group=gV)
+
+// ============================================================================
+//  INSTRUMENT DETECTION + EFFECTIVE PARAMETERS
+// ============================================================================
+sym = str.upper(syminfo.ticker)
+autoNas = str.contains(sym,"NAS") or str.contains(sym,"US100") or str.contains(sym,"USTEC") or str.contains(sym,"NDX") or str.contains(sym,"NDQ")
+autoDow = str.contains(sym,"US30") or str.contains(sym,"DJI") or str.contains(sym,"DOW") or str.contains(sym,"WS30") or str.contains(sym,"WALL")
+detected   = autoNas ? "NAS100" : autoDow ? "US30" : "Other"
+profile    = profileMode == "Auto" ? detected : profileMode
+isSupported = profile == "NAS100" or profile == "US30"
+nas = profile == "NAS100"
+
+// Preset values (starting points) override the [manual] inputs when presets ON
+f_minScore   = usePresets ? 3                  : minScore
+f_impulseATR = usePresets ? (nas ? 1.2 : 1.0)  : impulseATR
+f_useZoneVol = usePresets ? true               : useZoneVol
+f_departVol  = usePresets ? (nas ? 1.3 : 1.2)  : departVolMult
+f_slBufATR   = usePresets ? (nas ? 0.7 : 0.5)  : slBufATR
+f_rr         = usePresets ? 2.0                : rr
+
+inSession = not na(time(timeframe.period, sessionTime, sessionTz))
+sessOk    = (not useSession) or inSession
+symOk     = (not restrictSym) or isSupported
+
+// ============================================================================
+//  CORE CALCULATIONS
+// ============================================================================
+atr     = ta.atr(atrLen)
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+
+bullTrend = emaFast > emaSlow and (not usePriceLoc or close > emaFast)
+bearTrend = emaFast < emaSlow and (not usePriceLoc or close < emaFast)
+
+htfFast = request.security(syminfo.tickerid, htfTf, ta.ema(close, emaFastLen), lookahead=barmerge.lookahead_off)
+htfSlow = request.security(syminfo.tickerid, htfTf, ta.ema(close, emaSlowLen), lookahead=barmerge.lookahead_off)
+htfBull = useHtf ? (htfFast > htfSlow) : bullTrend
+htfBear = useHtf ? (htfFast < htfSlow) : bearTrend
+
+[diP, diM, adxVal] = ta.dmi(adxLen, adxLen)
+trendStrong = (not useAdx) or adxVal >= adxMin
+
+volAvg   = ta.sma(volume, volLen)
+volSpike = volume > volAvg * volMult
+rsi      = ta.rsi(close, rsiLen)
+
+bodyNow  = math.abs(close - open)
+bodyPrev = math.abs(close[1] - open[1])
+bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1] and bodyNow >= bodyPrev * engulfBodyR
+bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1] and bodyNow >= bodyPrev * engulfBodyR
+bullConfirm = (not useEngulf or bullEngulf) and (not useVol or volSpike)
+bearConfirm = (not useEngulf or bearEngulf) and (not useVol or volSpike)
+
+tapLow  = ta.lowest(low,  tapBars)
+tapHigh = ta.highest(high, tapBars)
+
+lowestAfter  = ta.lowest(low,     pivotLen)
+highestAfter = ta.highest(high,   pivotLen)
+maxVolAfter  = ta.highest(volume, pivotLen)
+
+// ============================================================================
+//  ZONE STORAGE
+// ============================================================================
+var dzTop   = array.new<float>(0)
+var dzBot   = array.new<float>(0)
+var dzBox   = array.new<box>(0)
+var dzFresh = array.new<bool>(0)
+var szTop   = array.new<float>(0)
+var szBot   = array.new<float>(0)
+var szBox   = array.new<box>(0)
+var szFresh = array.new<bool>(0)
+
+// ---- New SUPPLY zone (pivot high) ------------------------------------------
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+if not na(ph)
+    p      = pivotLen
+    topP   = high[p]
+    bodyHi = math.max(open[p], close[p])
+    bodyLo = math.min(open[p], close[p])
+    float zTop = topP
+    float zBot = zoneStyle == "Wick" ? bodyHi : zoneStyle == "Body" ? bodyLo : low[p]
+    rawWidth    = zTop - zBot
+    impulseDown = topP - lowestAfter
+    volOk   = (not f_useZoneVol) or (maxVolAfter >= volAvg * f_departVol)
+    impOk   = (not useImpulse) or (impulseDown >= f_impulseATR * atr[p])
+    widthOk = rawWidth <= maxZoneATR * atr[p]
+    if impOk and volOk and widthOk
+        if (zTop - zBot) < minZoneATR * atr[p]
+            zBot := zTop - minZoneATR * atr[p]
+        b = box.new(bar_index - p, zTop, bar_index, zBot, border_color=color.new(color.red,0), border_width=1, bgcolor = showZones ? color.new(color.red,85) : na, extend=extend.right)
+        array.push(szTop, zTop)
+        array.push(szBot, zBot)
+        array.push(szBox, b)
+        array.push(szFresh, true)
+        if array.size(szTop) > maxZones
+            box.delete(array.shift(szBox))
+            array.shift(szTop)
+            array.shift(szBot)
+            array.shift(szFresh)
+
+// ---- New DEMAND zone (pivot low) -------------------------------------------
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+if not na(pl)
+    p      = pivotLen
+    botP   = low[p]
+    bodyHi = math.max(open[p], close[p])
+    bodyLo = math.min(open[p], close[p])
+    float zBot = botP
+    float zTop = zoneStyle == "Wick" ? bodyLo : zoneStyle == "Body" ? bodyHi : high[p]
+    rawWidth  = zTop - zBot
+    impulseUp = highestAfter - botP
+    volOk   = (not f_useZoneVol) or (maxVolAfter >= volAvg * f_departVol)
+    impOk   = (not useImpulse) or (impulseUp >= f_impulseATR * atr[p])
+    widthOk = rawWidth <= maxZoneATR * atr[p]
+    if impOk and volOk and widthOk
+        if (zTop - zBot) < minZoneATR * atr[p]
+            zTop := zBot + minZoneATR * atr[p]
+        b = box.new(bar_index - p, zTop, bar_index, zBot, border_color=color.new(color.green,0), border_width=1, bgcolor = showZones ? color.new(color.green,85) : na, extend=extend.right)
+        array.push(dzTop, zTop)
+        array.push(dzBot, zBot)
+        array.push(dzBox, b)
+        array.push(dzFresh, true)
+        if array.size(dzTop) > maxZones
+            box.delete(array.shift(dzBox))
+            array.shift(dzTop)
+            array.shift(dzBot)
+            array.shift(dzFresh)
+
+// ============================================================================
+//  ZONE INTERACTION (tap + invalidation)
+// ============================================================================
+bool  longZoneHit  = false
+float longZBot     = na
+bool  shortZoneHit = false
+float shortZTop    = na
+
+i = array.size(dzTop) - 1
+while i >= 0
+    zt = array.get(dzTop, i)
+    zb = array.get(dzBot, i)
+    bx = array.get(dzBox, i)
+    fr = array.get(dzFresh, i)
+    if close < zb
+        box.delete(bx)
+        array.remove(dzTop, i)
+        array.remove(dzBot, i)
+        array.remove(dzBox, i)
+        array.remove(dzFresh, i)
+    else
+        if tapLow <= zt and close >= zb
+            if (not freshOnly or fr) and not longZoneHit
+                longZoneHit := true
+                longZBot := zb
+            array.set(dzFresh, i, false)
+    i -= 1
+
+j = array.size(szTop) - 1
+while j >= 0
+    zt = array.get(szTop, j)
+    zb = array.get(szBot, j)
+    bx = array.get(szBox, j)
+    fr = array.get(szFresh, j)
+    if close > zt
+        box.delete(bx)
+        array.remove(szTop, j)
+        array.remove(szBot, j)
+        array.remove(szBox, j)
+        array.remove(szFresh, j)
+    else
+        if tapHigh >= zb and close <= zt
+            if (not freshOnly or fr) and not shortZoneHit
+                shortZoneHit := true
+                shortZTop := zt
+            array.set(szFresh, j, false)
+    j -= 1
+
+// ============================================================================
+//  SETUPS + CONFLUENCE SCORE
+// ============================================================================
+rawLong  = longZoneHit  and bullConfirm
+rawShort = shortZoneHit and bearConfirm
+
+pullEma   = low <= emaFast and high >= emaFast
+bigCandle = bodyNow >= atr
+
+int longScore = 0
+longScore := longScore + (bullTrend ? 1 : 0) + (htfBull ? 1 : 0) + ((rsi >= rsiBull) ? 1 : 0) + (pullEma ? 1 : 0) + (volSpike ? 1 : 0) + (bigCandle ? 1 : 0)
+int shortScore = 0
+shortScore := shortScore + (bearTrend ? 1 : 0) + (htfBear ? 1 : 0) + ((rsi <= rsiBear) ? 1 : 0) + (pullEma ? 1 : 0) + (volSpike ? 1 : 0) + (bigCandle ? 1 : 0)
+
+longAligned  = bullTrend
+shortAligned = bearTrend
+longProb  = longAligned  ? "High" : "Low (counter-trend)"
+shortProb = shortAligned ? "High" : "Low (counter-trend)"
+
+tfSec   = timeframe.in_seconds(timeframe.period)
+inRange = tfSec >= 15 * 60 and tfSec <= 4 * 60 * 60
+tfOk    = (not useTimeGuard) or inRange
+
+longTradeOk  = rawLong  and longScore  >= f_minScore and (not onlyWithTrend or longAligned)  and trendStrong and tfOk and symOk and sessOk
+shortTradeOk = rawShort and shortScore >= f_minScore and (not onlyWithTrend or shortAligned) and trendStrong and tfOk and symOk and sessOk
+if longTradeOk and shortTradeOk
+    if longScore >= shortScore
+        shortTradeOk := false
+    else
+        longTradeOk := false
+
+// ============================================================================
+//  RISK / EXITS
+// ============================================================================
+float longSL    = longZoneHit  ? (longZBot - f_slBufATR * atr) : na
+float longRisk  = longZoneHit  ? (close - longSL) : na
+float qtyLong   = (not na(longRisk) and longRisk > 0 and riskPerc > 0) ? (strategy.equity * riskPerc / 100.0) / longRisk : na
+float shortSL   = shortZoneHit ? (shortZTop + f_slBufATR * atr) : na
+float shortRisk = shortZoneHit ? (shortSL - close) : na
+float qtyShort  = (not na(shortRisk) and shortRisk > 0 and riskPerc > 0) ? (strategy.equity * riskPerc / 100.0) / shortRisk : na
+
+var float entryPrice = na
+var float initSL     = na
+var float tp1        = na
+var float tp2        = na
+var bool  be         = false
+
+if longTradeOk and strategy.position_size == 0 and not na(qtyLong)
+    strategy.entry("Long", strategy.long, qty = qtyLong)
+    entryPrice := close
+    initSL     := longSL
+    tp1        := close + tp1R * longRisk
+    tp2        := close + f_rr * longRisk
+    be         := false
+if shortTradeOk and strategy.position_size == 0 and not na(qtyShort)
+    strategy.entry("Short", strategy.short, qty = qtyShort)
+    entryPrice := close
+    initSL     := shortSL
+    tp1        := close - tp1R * shortRisk
+    tp2        := close - f_rr * shortRisk
+    be         := false
+
+if strategy.position_size > 0
+    if useScaleOut
+        if not be and high >= tp1
+            be := true
+        float curSL = be ? entryPrice : initSL
+        strategy.exit("L TP1",  "Long", qty_percent = tp1Pct, limit = tp1, stop = curSL)
+        strategy.exit("L Exit", "Long", limit = tp2, stop = curSL)
+    else
+        strategy.exit("L Exit", "Long", stop = initSL, limit = tp2)
+else if strategy.position_size < 0
+    if useScaleOut
+        if not be and low <= tp1
+            be := true
+        float curSL = be ? entryPrice : initSL
+        strategy.exit("S TP1",  "Short", qty_percent = tp1Pct, limit = tp1, stop = curSL)
+        strategy.exit("S Exit", "Short", limit = tp2, stop = curSL)
+    else
+        strategy.exit("S Exit", "Short", stop = initSL, limit = tp2)
+else
+    be := false
+
+// ============================================================================
+//  ON-SCREEN SIGNALS / VISUALS
+// ============================================================================
+plot(emaFast, "Fast EMA", color=color.new(color.orange,0), linewidth=1)
+plot(emaSlow, "Slow EMA", color=color.new(color.blue,0),   linewidth=2)
+bgcolor(bullTrend ? color.new(color.green,93) : bearTrend ? color.new(color.red,93) : na, title="Trend background")
+bgcolor(useSession and not inSession ? color.new(color.gray,90) : na, title="Outside session")
+
+plotshape(longTradeOk,  title="BUY marker",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime,0), size=size.small)
+plotshape(shortTradeOk, title="SELL marker", style=shape.triangledown, location=location.abovebar, color=color.new(color.red,0),  size=size.small)
+
+longInfo  = rawLong  and not longTradeOk
+shortInfo = rawShort and not shortTradeOk
+plotshape(longInfo,  title="Long (less probable)",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.gray,30), size=size.tiny)
+plotshape(shortInfo, title="Short (less probable)", style=shape.triangledown, location=location.abovebar, color=color.new(color.gray,30), size=size.tiny)
+
+if longTradeOk
+    label.new(bar_index, low, "BUY " + str.tostring(longScore) + "/6\n" + longProb, style=label.style_label_up, yloc=yloc.belowbar, color=color.new(color.green,10), textcolor=color.white, size=size.small)
+if shortTradeOk
+    label.new(bar_index, high, "SELL " + str.tostring(shortScore) + "/6\n" + shortProb, style=label.style_label_down, yloc=yloc.abovebar, color=color.new(color.red,10), textcolor=color.white, size=size.small)
+
+// Warning if the symbol is not NAS100 / US30 and restriction is on
+if restrictSym and not isSupported and barstate.islast
+    label.new(bar_index, high, "This symbol (" + syminfo.ticker + ") is not NAS100/US30.\nTrading disabled. If your broker uses a different ticker,\nset the Instrument profile manually in settings.", style=label.style_label_down, color=color.new(color.orange,0), textcolor=color.white, size=size.normal)
+
+// ============================================================================
+//  INFO TABLE
+// ============================================================================
+var string lastSig = "—"
+if longTradeOk
+    lastSig := "BUY "  + str.tostring(longScore)  + "/6"
+if shortTradeOk
+    lastSig := "SELL " + str.tostring(shortScore) + "/6"
+
+var table tbl = table.new(position.top_right, 2, 9, border_width=1)
+if barstate.islast and showTable
+    profCol  = isSupported ? color.new(color.teal,30) : color.new(color.orange,20)
+    sessTxt  = not useSession ? "off" : (inSession ? "In" : "Out")
+    sessCol  = not useSession ? color.new(color.gray,50) : (inSession ? color.new(color.green,40) : color.new(color.red,40))
+    trendTxt = bullTrend ? "Bullish" : bearTrend ? "Bearish" : "Neutral"
+    trendCol = bullTrend ? color.new(color.green,40) : bearTrend ? color.new(color.red,40) : color.new(color.gray,40)
+    htfTxt   = htfBull ? "Bullish" : htfBear ? "Bearish" : "Neutral"
+    htfCol   = htfBull ? color.new(color.green,40) : htfBear ? color.new(color.red,40) : color.new(color.gray,40)
+    hdr = color.new(color.gray,70)
+    table.cell(tbl, 0, 0, "Profile", text_color=color.white, bgcolor=hdr)
+    table.cell(tbl, 1, 0, profile + (usePresets ? " (preset)" : ""), text_color=color.white, bgcolor=profCol)
+    table.cell(tbl, 0, 1, "Session", text_color=color.white, bgcolor=hdr)
+    table.cell(tbl, 1, 1, sessTxt, text_color=color.white, bgcolor=sessCol)
+    table.cell(tbl, 0, 2, "Trend", text_color=color.white, bgcolor=hdr)
+    table.cell(tbl, 1, 2, trendTxt, text_color=color.white, bgcolor=trendCol)
+    table.cell(tbl, 0, 3, "HTF " + htfTf, text_color=color.white, bgcolor=hdr)
+    table.cell(tbl, 1, 3, htfTxt, text_color=color.white, bgcolor=htfCol)
+    table.cell(tbl, 0, 4, "ADX", text_color=color.white, bgcolor=hdr)
+    table.cell(tbl, 1, 4, str.tostring(adxVal, "#.0"), text_color=color.white, bgcolor=(trendStrong ? color.new(color.green,50) : color.new(color.red,50)))
+    table.cell(tbl, 0, 5, "RSI", text_color=color.white, bgcolor=hdr)
+    table.cell(tbl, 1, 5, str.tostring(rsi, "#.0"), text_color=color.white, bgcolor=color.new(color.gray,50))
+    table.cell(tbl, 0, 6, "Demand zones", text_color=color.white, bgcolor=hdr)
+    table.cell(tbl, 1, 6, str.tostring(array.size(dzTop)), text_color=color.white, bgcolor=color.new(color.green,60))
+    table.cell(tbl, 0, 7, "Supply zones", text_color=color.white, bgcolor=hdr)
+    table.cell(tbl, 1, 7, str.tostring(array.size(szTop)), text_color=color.white, bgcolor=color.new(color.red,60))
+    table.cell(tbl, 0, 8, "Last signal", text_color=color.white, bgcolor=hdr)
+    table.cell(tbl, 1, 8, lastSig, text_color=color.white, bgcolor=color.new(color.gray,50))
+
+// ============================================================================
+//  ALERTS  (set the alert to "Once Per Bar Close")
+// ============================================================================
+alertcondition(longTradeOk,  "BUY signal",  "S/D v3: BUY confirmed")
+alertcondition(shortTradeOk, "SELL signal", "S/D v3: SELL confirmed")
