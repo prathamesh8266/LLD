@@ -362,3 +362,8 @@ class KingFactory(MealFactory):
         if garlic_bread_class is None:
             raise ValueError(f"Unknown garlic bread type: {garlic_bread_type}")
         return garlic_bread_class()
+    
+
+# used in notification system where there are multiple notification types, eg. sms, email, push
+# the way you will have to decide strategy pattern to use of factory pattern is by checking what you actually want.
+# seperate object creation or strategy implementation as notification system can be created using strategy pattern toor
