@@ -5,8 +5,7 @@ from enum import Enum
 class Algo(Enum):
     
     FIXED_WINDOW = "fixed_window"
-    SLIDING_WINDOW = "sliding_window"
-    TOKEN_BUCKET = "token_bucket"
+    ROLLING_WINDOW = "rolling_window"
     
     
 class RateLimiter:
@@ -15,7 +14,8 @@ class RateLimiter:
         self._request_per_min = request_per_min
         self._algorithm = algorithm
         self._algorithm_list = {
-            Algo.FIXED_WINDOW : FixedWindow()
+            Algo.FIXED_WINDOW : FixedWindow(),
+            Algo.ROLLING_WINDOW : RollingWindowLog()
         }
         
     def setAlgo(self, algorithm: Algo) -> RateLimiter:
